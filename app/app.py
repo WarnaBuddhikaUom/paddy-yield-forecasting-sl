@@ -31,12 +31,6 @@ def load_history():
     return h
 
 
-@st.cache_resource
-def load_explainer(_model):
-    import shap
-    return shap.TreeExplainer(_model.named_steps["model"])
-
-
 bundle = load_bundle()
 model = bundle["model"]
 hist = load_history()
@@ -124,30 +118,28 @@ with tab_pred:
                 st.info(f"Recorded DCS yield for {district} {season} {int(year)}: **{d['actual']:,.0f} kg/ha** "
                         f"(model error {pred - d['actual']:+,.0f} kg/ha).")
 
-            # Explain this prediction with SHAP (one-hot districts/seasons grouped back together)
+            # Explain this prediction with the EBM's own (exact) local explanation
             try:
-                explainer = load_explainer(model)
-                prep = model.named_steps["prep"]
-                names = list(prep.get_feature_names_out())
-                sv = explainer(pd.DataFrame(np.asarray(prep.transform(x)), columns=names))
-                contrib = pd.Series(sv.values[0], index=names)
-                grp = contrib.groupby(lambda n: "District" if n.startswith("District_") else
-                                      "Season" if n.startswith("Season_") else n).sum()
-                grp = grp.reindex(grp.abs().sort_values().index)
-                fig, ax = plt.subplots(figsize=(7, 3.8))
-                ax.barh(grp.index, grp.values, color=["#2e8b57" if v > 0 else "#c0392b" for v in grp.values])
+                loc = model.explain_local(x).data(0)
+                contrib = pd.Series(loc["scores"], index=loc["names"])
+                intercept = float(np.ravel(model.intercept_)[0])
+                top = contrib.reindex(contrib.abs().sort_values().index).tail(12)
+                fig, ax = plt.subplots(figsize=(7.5, 4.2))
+                ax.barh(top.index, top.values, color=["#2e8b57" if v > 0 else "#c0392b" for v in top.values])
                 ax.axvline(0, color="k", lw=0.6)
                 ax.set_xlabel("Contribution to the forecast (kg/ha)")
-                ax.set_title(f"Why this forecast? (start: average {float(np.ravel(sv.base_values)[0]):,.0f} kg/ha)")
+                ax.set_title(f"Why this forecast?  {intercept:,.0f} (average) + contributions = {pred:,.0f} kg/ha")
                 ax.spines[["top", "right"]].set_visible(False)
                 st.pyplot(fig)
-                st.caption("Green bars raise the forecast, red bars lower it (SHAP values).")
+                st.caption("Green bars raise the forecast, red bars lower it. Because the EBM is additive, these "
+                           "contributions are exact: the average plus all bars equals the prediction. "
+                           "Terms with '&' are learned pairwise interactions.")
             except Exception as exc:  # explanation is optional – never block the prediction
                 st.caption(f"Explanation unavailable: {exc}")
 
 with tab_about:
     st.markdown(f"""
-**Model:** {bundle['model_name']} (tuned with time-series cross-validation), test RMSE on 2016–2023
+**Model:** {bundle['model_name']} – a glass-box generalised additive model with pairwise interactions, tuned with time-series cross-validation, test RMSE on 2016–2023
 seasons ≈ **{bundle['test_rmse']:,.0f} kg/ha**, MAE ≈ **{bundle['test_mae']:,.0f} kg/ha**.
 
 **Inputs used (all known at sowing time):** district, season, year, sown area by irrigation type,
@@ -159,7 +151,7 @@ fertilizer ban, floods or droughts after sowing). Use it as a planning baseline,
     comp = ROOT / "models" / "model_comparison.csv"
     if comp.exists():
         st.dataframe(pd.read_csv(comp, index_col=0).round(1), width="stretch")
-    for img in ["05_model_comparison.png", "07_shap_importance.png"]:
+    for img in ["05_model_comparison.png", "07_ebm_importance.png", "08_ebm_shapes.png"]:
         p = ROOT / "figures" / img
         if p.exists():
             st.image(str(p))

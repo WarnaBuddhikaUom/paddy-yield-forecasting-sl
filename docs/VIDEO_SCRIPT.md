@@ -1,29 +1,24 @@
-# Narration script for the 5-minute video (Buddhika K H W)
+# Re-recording script (EBM version) – Buddhika K H W
 
-Total length **4:37**. Read each block while the matching part of the video plays.
-About 140 words per minute is a calm pace. Every block has a second or two of spare time.
+The model changed from LightGBM to the **Explainable Boosting Machine**, so **8 short parts** need new narration.
+The other 6 parts reuse your existing recording, so you don't need to say them again.
 
-| Start | End | On screen | Say |
+Play **Rerecord_teleprompter.mp4** (2:36). It contains only the new parts, with the words on screen.
+Record yourself reading along, at 0.5× speed like last time if you prefer. Then send me the recording, and I'll splice it into the full video (about 4:30).
+
+| # | On screen | Status | Say |
 |---|---|---|---|
-| 00:00 | 00:11 | Title | Hello, I am Buddhika K H W. In this video I present my Applied Machine Learning project: forecasting district-level paddy yield in Sri Lanka at sowing time. |
-| 00:11 | 00:35 | Problem | Rice is our staple food. Fertilizer, Paddy Marketing Board purchasing, storage and imports are all planned months before the harvest, and the 2022 fertilizer ban showed how costly a surprise can be. So my goal is to predict each district's average yield, in kilograms per hectare, for the coming Maha or Yala season, using only information available at sowing. |
-| 00:35 | 00:54 | Data cleaning | I used Department of Census and Statistics paddy data from 1979 to 2023. The audit found four problems: one hundred duplicated rows, four regions that overlap real districts, a unit error where yields labelled tonnes are really kilograms per hectare, and numbers stored as text. |
-| 00:54 | 01:16 | Notebook running: data audit & trend | Here is the notebook running. The audit cell counts each problem, and after cleaning we have twenty-five districts over forty-five years. The trend chart shows yields roughly doubled since 1980, then collapsed in 2022 when chemical fertilizer was banned. |
-| 01:16 | 01:34 | EDA & features | Irrigation matters: the rain-fed share is strongly negatively correlated with yield. I only used features known at sowing time: district, season, year, sown area by irrigation type, and past yields. Harvested area and production are excluded, because they would leak the answer. |
-| 01:34 | 01:56 | Method | I split the data by time, training on 1979 to 2015 and testing on 2016 to 2023, so the model never learns from the future. Hyperparameters were designed, not left at defaults. For example, LightGBM uses few leaves and large minimum leaf sizes, because there are fewer than two thousand training rows. |
-| 01:56 | 02:12 | Notebook running: tuning & comparison table | In the notebook you can see the tuning results and the full comparison table. LightGBM had the lowest cross-validation error, so it was selected, using validation scores only, never the test set. |
-| 02:12 | 02:34 | Results | Grey bars are existing approaches, green bars are the ensembles. LightGBM's cross-validation error is seventeen percent lower than linear regression. On unseen seasons it is sixteen percent better than persistence, and sixty percent of forecasts are within ten percent of the actual yield. |
-| 02:34 | 02:53 | Limitations | There are two honest limitations. Tree models cannot predict above the yields they have seen, so record years are under-predicted, which is why the final model is retrained up to 2023. And no model could foresee the 2022 fertilizer shock. |
-| 02:53 | 03:12 | SHAP (global) | SHAP explains the model. Recent yield history is the main driver. A higher rain-fed share lowers the forecast, while major irrigation raises it, and Year captures the technology trend. The district name adds almost nothing, so the model learns real agronomic drivers. |
-| 03:12 | 03:34 | Held-out sample: SHAP & LIME | For inference I held out Polonnaruwa, Yala 2023. The pickled model predicts 4,225 kilograms per hectare against an actual 4,918. The SHAP waterfall shows why: the year 2023 pulls the forecast down, because the model learned the 2022 collapse. LIME agrees on the main drivers. |
-| 03:34 | 03:42 | Front end | The front end was generated with GenAI prompts, and for the bonus there is a Dockerfile and a CI pipeline. |
-| 03:42 | 04:22 | Live app demo | Here is the live app. District history is pre-filled from the statistics. I click predict: 4,225 kilograms per hectare, with an error range and production estimate, and the SHAP chart explains it. Now Kalutara in Maha, a mostly rain-fed district. The forecast drops to about 2,900, close to the actual 2,735, and the rain-fed share now pulls it down. |
-| 04:22 | 04:37 | Conclusion | To conclude: careful cleaning, leakage-free features and tuned ensembles give forecasts sixteen to twenty-two percent better than the persistence baseline, with explanations that make sense. Thank you. |
-
-## How to record
-
-1. Play **Paddy_Yield_Presentation_teleprompter.mp4**. The captions show exactly what to say and when.
-2. Record your voice with your phone or PC at the same time, reading the captions aloud. One continuous take is easiest.
-3. Send the recording back, and I will merge it with the clean video (no captions), fix the timing, and level the volume. Or merge it yourself in any editor (CapCut, Clipchamp, iMovie): put the clean video on the track and your audio underneath.
-
-Tip: start talking when the title slide appears, about half a second in.
+| 1 | Title | ✅ already recorded | _(reuse your existing take)_ |
+| 2 | Problem | ✅ already recorded | _(reuse your existing take)_ |
+| 3 | Data cleaning | ✅ already recorded | _(reuse your existing take)_ |
+| 4 | Notebook: data audit & trend | ✅ already recorded | _(reuse your existing take)_ |
+| 5 | EDA & features | ✅ already recorded | _(reuse your existing take)_ |
+| 6 | New algorithm: EBM | 🎙 **record** | For the main model I chose an algorithm not covered in the lectures: the Explainable Boosting Machine. It learns one curve per feature, plus a few pairwise interactions, using boosting. So the curves are the model, and the explanations are exact, unlike random forests or XGBoost, which are black boxes. |
+| 7 | Notebook: EBM tuning & comparison | 🎙 **record** | In the notebook, the EBM was tuned on the time-series validation folds only, and then compared with the ensembles taught in the lectures. |
+| 8 | Results | 🎙 **record** | On the unseen years the EBM's error is 623 kilograms per hectare. That matches the black-box models and is 16 percent better than persistence. Sixty percent of forecasts are within ten percent, so transparency costs very little. |
+| 9 | Limitations & fairness | 🎙 **record** | No model could foresee the 2022 fertilizer ban, and the curves cannot extrapolate record yields, so the model is retrained every season. Accuracy is uneven: Northern, conflict-affected districts have double the error and are under-predicted, so they need extra human review. The data are public and contain no personal information. |
+| 10 | What the EBM learned | 🎙 **record** | These curves are the model itself. Higher past yields raise the forecast, the rain-fed share lowers it by up to about 400 kilograms, and major irrigation raises it. Partial dependence and SHAP on LightGBM agree, and this matches agronomy. |
+| 11 | Held-out sample | 🎙 **record** | For the held-out case, Polonnaruwa Yala 2023, the pickled model predicts 4,731 kilograms per hectare against an actual 4,918, under four percent error. The average plus each contribution equals the prediction exactly. |
+| 12 | Front end | ✅ already recorded | _(reuse your existing take)_ |
+| 13 | Live app demo | 🎙 **record** | Here is the live app. I click predict: 4,731 kilograms per hectare, with an error range, and the chart shows the EBM's exact explanation. Now Kalutara in Maha, a mostly rain-fed district. The forecast drops to about 2,850, close to the actual 2,735. |
+| 14 | Conclusion | 🎙 **record** | To conclude: the Explainable Boosting Machine is as accurate as black-box models, sixteen to twenty-two percent better than persistence, with exact explanations that match agronomy. Thank you. |

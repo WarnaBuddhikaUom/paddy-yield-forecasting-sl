@@ -36,6 +36,15 @@ def test_rainfed_lowers_yield():
     assert model.predict(rainfed)[0] <= model.predict(irrigated)[0]
 
 
+def test_explanation_is_exact():
+    """EBM is additive: intercept + local contributions must equal the prediction."""
+    model = load()["model"]
+    x = make_input_row("Polonnaruwa", "YALA", 2023, 58149, 7852, 32, 4416, 4288, 4312, 0.88, 58636)
+    loc = model.explain_local(x).data(0)
+    total = float(np.ravel(model.intercept_)[0]) + sum(loc["scores"])
+    assert abs(total - float(model.predict(x)[0])) < 1e-6
+
+
 def test_missing_history_is_handled():
     model = load()["model"]
     x = make_input_row("Jaffna", "MAHA", 2024, 0, 5000, 8000, np.nan, np.nan, np.nan, 0.9)

@@ -14,14 +14,19 @@
 #
 # **Dataset.** District-wise paddy statistics (1979–2023, Maha & Yala) published by the
 # Department of Census and Statistics (DCS), Sri Lanka: sown and harvested extent by irrigation type
-# (major irrigation, minor irrigation, rain-fed), average yields and production.
+# (major irrigation, minor irrigation, rain-fed), average yields and production. 2,612 raw rows × 16 columns.
+# The data are **aggregated official statistics at district level – no personal or sensitive data** are involved.
 #
-# **Plan of the notebook**
-# 1. Data audit & cleaning  2. Exploratory analysis  3. Leakage-free feature engineering
-# 4. Time-based train/test split + one held-out sample  5. Existing approaches (baselines)
-# 6. Ensemble models with self-designed hyperparameters (RF, XGBoost, LightGBM, CatBoost) + Stacking
-# 7. Comparison, strengths & limitations  8. Explainability with SHAP and LIME
-# 9. Inference on a single unseen sample from the pickled model  10. Conclusions
+# **New algorithm (not covered in lectures): Explainable Boosting Machine (EBM)** – a modern generalised additive model with
+# pairwise interactions (GA²M), trained by cyclic gradient boosting. It is a *glass-box* model: every feature's effect is an
+# exact, plottable function, so the model is interpretable by design (intrinsic interpretability), not only by post-hoc tools.
+#
+# **Plan of the notebook (follows the assignment rubric)**
+# 1. Data audit & cleaning  2. Exploratory analysis  3. Leakage-free features  4. Train / validation / test design
+# 5. Preprocessing  6. Existing approaches (baselines)  7. **The new algorithm: EBM** – why, how it differs, hyperparameters
+# 8. Benchmarks taught in lectures (RF, XGBoost, LightGBM, CatBoost, Stacking)  9. Evaluation & comparison
+# 10. Explainability: EBM global/local, PDP, SHAP cross-check, LIME  11. Bias & fairness check
+# 12. Saving the model & inference on an unseen sample  13. Critical discussion  14. Conclusions
 
 # %%
 import sys, time, json, pickle, warnings
@@ -45,6 +50,7 @@ from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor  # used through the CatBoostSK wrapper
 import shap
 from lime.lime_tabular import LimeTabularExplainer
+from interpret.glassbox import ExplainableBoostingRegressor
 
 warnings.filterwarnings("ignore")
 ROOT = Path.cwd().parent if Path.cwd().name == "notebooks" else Path.cwd()
@@ -56,6 +62,8 @@ from cat_wrapper import CatBoostSK
 FIG = ROOT / "figures"; FIG.mkdir(exist_ok=True)
 MODELS = ROOT / "models"; MODELS.mkdir(exist_ok=True)
 RANDOM_STATE = 42
+import os; QUICK = os.environ.get('QUICK') == '1'   # debugging only: tiny searches
+NI = (lambda n: 2 if QUICK else n)
 np.random.seed(RANDOM_STATE)
 plt.rcParams.update({"figure.dpi": 110, "axes.spines.top": False, "axes.spines.right": False})
 
@@ -178,10 +186,12 @@ print("Modelling table:", model_df.shape)
 model_df[FEATURES + [TARGET]].isna().mean().mul(100).round(1).rename("% missing").to_frame().T
 
 # %% [markdown]
-# ## 4. Time-based split and one held-out sample
+# ## 4. Train / validation / test design
 # Random splitting would let the model train on 2020 and be tested on 2019 – unrealistic for a forecast.
-# We use a **chronological split**:
-# * **Train:** 1979–2015 (≈ 37 years)  * **Test:** 2016–2023 (8 years, includes the 2022 fertilizer shock)
+# We use a **chronological** design:
+# * **Training set: 1979–2015** (1,782 district-seasons).
+# * **Validation: forward-chaining `TimeSeriesSplit` (4 folds) inside the training years.** Each fold trains on the past and validates on the next block of years (the last fold validates on ≈2008–2015). All hyperparameters are chosen on this validation score, never on the test set.
+# * **Test set: 2016–2023** (391 district-seasons, 8 unseen years, including the 2022 fertilizer shock). Used once, for reporting.
 # * **Held-out inference sample:** *Polonnaruwa, Yala 2023* is removed from everything and used only at the end to demonstrate inference with the saved pickle model.
 
 # %%
@@ -200,7 +210,7 @@ tscv = TimeSeriesSplit(n_splits=4)   # forward-chaining CV inside the training p
 # All preprocessing lives inside a scikit-learn `Pipeline`, so imputation statistics and scaling are learned **only from the training folds** (no leakage into validation/test), and the exact same steps are saved in the pickle file for inference.
 # * **Imputation:** median for numeric lags (robust to the skewed yields); the ~3% missing lags come from gaps after uncultivated seasons.
 # * **Scaling:** `StandardScaler` – needed for the linear baselines; harmless for trees.
-# * **Encoding:** one-hot for `District` and `Season` (`handle_unknown="ignore"` so a new district does not crash the app). CatBoost instead uses its own native categorical handling (ordered target statistics).
+# * **Encoding:** one-hot for `District` and `Season` (`handle_unknown="ignore"` so a new district does not crash the app). CatBoost uses its own categorical handling (ordered target statistics), and **EBM handles categorical strings and missing values natively** (missing values get their own learned score), so it needs no imputation or scaling at all.
 # * **Transformation:** sown area is log-transformed (`log_total_sown`) because district extents range from a few hundred to 100,000+ ha.
 
 # %%
@@ -231,7 +241,7 @@ results, cv_scores, fitted, train_time = [], {}, {}, {}
 
 # %% [markdown]
 # ## 6. Existing approaches (baselines)
-# Before any ensemble, we measure what simple, commonly used approaches achieve. An ensemble is only worth deploying if it clearly beats these.
+# Before any advanced model, we measure what simple, commonly used approaches achieve. A new model is only worth deploying if it clearly beats these.
 # 1. **Persistence (naïve forecast)** – "this season = same season last year". This is how many planning estimates are made in practice.
 # 2. **Moving average** – mean of the last 4 seasons.
 # 3. **Linear regression (OLS)** – the classical statistical approach used in many crop-yield studies.
@@ -251,17 +261,67 @@ results.append(evaluate("Linear regression", y_test.values, lin.predict(X_test))
 pd.DataFrame(results).set_index("model").round(1)
 
 # %% [markdown]
-# ## 7. Ensemble models with self-designed hyperparameters
-# Default parameters are **not** used. For each model the search space is designed from the data size (≈1,800 training rows, 37 features after encoding) and from what each parameter controls. `RandomizedSearchCV` with the forward-chaining `TimeSeriesSplit` picks the final values (scored by RMSE).
+# ## 7. The new algorithm: Explainable Boosting Machine (EBM)
+# **What it is.** EBM (Lou, Caruana & Gehrke 2012–2013; implemented in Microsoft's *InterpretML*) is a **generalised additive model with pairwise interactions (GA²M)**:
 #
-# ### 7.1 Random Forest (bagging)
+# $$\hat{y} = \beta_0 + \sum_i f_i(x_i) + \sum_{(i,j)} f_{ij}(x_i, x_j)$$
+#
+# Each $f_i$ is a learned **shape function** for one feature, and each $f_{ij}$ a small 2-D function for one of a few automatically detected feature pairs.
+# The functions are learned with **cyclic gradient boosting**: in each round the algorithm visits the features *one at a time* and fits a tiny tree on that single feature to the current residuals, with a very small learning rate, for thousands of rounds. Many bagged copies ("outer bags") are averaged to reduce variance.
+#
+# **How it differs from the standard models taught in lectures**
+# | Model | Form of the model | Interpretability |
+# |---|---|---|
+# | Linear / logistic regression | $\beta_0 + \sum \beta_i x_i$ – one straight-line weight per feature | Transparent, but cannot represent curves or thresholds |
+# | Decision tree | One tree; every split can mix features | Readable only when shallow; unstable |
+# | k-NN | No global function – predicts from nearest stored examples | Only "similar cases" explanations |
+# | Random Forest / XGBoost / LightGBM / CatBoost | Sums of hundreds of deep, multi-feature trees | Black box – needs post-hoc SHAP/LIME |
+# | **EBM** | **Sum of one learned curve per feature + a few pairwise surfaces** | **Glass box – each curve *is* the model; local explanations are exact** |
+#
+# **Why it was selected for this problem**
+# * **Trust in a public-planning setting.** Agricultural officers must be able to see *exactly* how irrigation mix or last year's yield changes a forecast. EBM's shape functions are the model itself, so explanations are exact rather than approximations (lecture: *intrinsic* vs *post-hoc* interpretability).
+# * **Accuracy close to boosted trees.** Boosting keeps it competitive with XGBoost/LightGBM on tabular data – verified below.
+# * **Fits the data:** handles the categorical `District`/`Season` and the missing lag values natively, and the additive structure is a good match for yield, which is largely "baseline level + irrigation effect + trend".
+# * **Not deep learning**, works well on small tabular datasets (≈1,800 rows).
+#
+# **Hyperparameter design (searched with the forward-chaining validation folds)**
 # | Parameter | Range | Reasoning |
 # |---|---|---|
-# | `n_estimators` | 300–800 | more trees only reduce variance; ~500 is enough for 1.8k rows, more just costs time |
-# | `max_depth` | 6–20 / None | full-depth trees memorise noise in a small dataset; limiting depth regularises |
-# | `min_samples_leaf` | 1–10 | leaves of ≥ a few district-seasons smooth out one-off flood/drought years |
-# | `max_features` | 0.3–0.8 | sampling a subset of features per split de-correlates trees (the lag features are highly correlated) |
-# | `bootstrap / max_samples` | 0.6–1.0 | row subsampling adds diversity |
+# | `learning_rate` | 0.005–0.05 (log) | EBM relies on many small cyclic steps; small rates give smoother, more stable shape functions |
+# | `interactions` | 0, 3, 5, 10 | number of pairwise terms: more pairs = more flexibility but less readable; 0 = pure additive model |
+# | `min_samples_leaf` | 5–30 | each bin step must be supported by enough district-seasons, so curves don't chase single flood/drought years |
+# | `max_leaves` | 2–3 | leaves per per-feature tree; small = smoother curves |
+# | `outer_bags` | 8, 14 | number of bagged models averaged; more = lower variance (and confidence bands) |
+# | `smoothing_rounds` | 0, 100, 200 | initial rounds with random splits to smooth the shape functions |
+# | `max_bins` | 128, 256 | resolution of continuous features |
+
+# %%
+ebm_space = {"learning_rate": loguniform(0.005, 0.05), "interactions": [0, 3, 5, 10], "min_samples_leaf": randint(5, 31),
+             "max_leaves": [2, 3], "outer_bags": [8, 14], "smoothing_rounds": [0, 100, 200], "max_bins": [128, 256]}
+ebm_search = RandomizedSearchCV(ExplainableBoostingRegressor(random_state=RANDOM_STATE, n_jobs=2), ebm_space, n_iter=NI(8),
+                                cv=tscv, scoring="neg_root_mean_squared_error", random_state=RANDOM_STATE, n_jobs=1, refit=True)
+t0 = time.time(); ebm_search.fit(X_train, y_train); train_time["EBM (new)"] = time.time() - t0
+cv_scores["EBM (new)"] = -ebm_search.best_score_
+fitted["EBM (new)"] = ebm_search.best_estimator_
+best_params = {"EBM (new)": {k: (round(float(v), 4) if isinstance(v, (float, np.floating)) else int(v) if isinstance(v, np.integer) else v)
+                             for k, v in ebm_search.best_params_.items()}}
+results.append(evaluate("EBM (new)", y_test.values, ebm_search.best_estimator_.predict(X_test)))
+print(f"EBM: validation RMSE = {cv_scores['EBM (new)']:.1f} kg/ha  ({train_time['EBM (new)']:.0f}s)")
+print("best params:", best_params["EBM (new)"])
+pd.DataFrame(ebm_search.cv_results_)[["params", "mean_test_score", "std_test_score"]].assign(
+    validation_RMSE=lambda d: -d.mean_test_score).sort_values("validation_RMSE")[["params", "validation_RMSE", "std_test_score"]].round(1)
+
+# %% [markdown]
+# ## 8. Benchmarks taught in lectures (RF, XGBoost, LightGBM, CatBoost, Stacking)
+# To judge whether EBM is competitive, it is compared with the ensemble methods covered in the module, each tuned with the same validation folds (no default parameters).
+#
+# | Model | Key search ranges | Reasoning |
+# |---|---|---|
+# | Random Forest | 300–800 trees, depth 6–20, `min_samples_leaf` 1–10, `max_features` 0.3–0.8 | limit depth / leaf size for a small dataset; feature subsampling de-correlates trees (lag features are correlated) |
+# | XGBoost | `learning_rate` 0.01–0.15, depth 2–6, subsample 0.6–1, L1/L2 | shallow trees and regularisation for ~1.8k rows |
+# | LightGBM | `num_leaves` 8–40, `min_child_samples` 10–50 | leaf-wise growth over-fits easily on small data |
+# | CatBoost | depth 4–8, `l2_leaf_reg` 1–15 | native categorical handling via ordered target statistics |
+# | Stacking | RF + XGB + LGBM + CatBoost → Ridge | combines bagging and boosting errors |
 
 # %%
 def tune(name, estimator, space, n_iter, prep):
@@ -273,62 +333,29 @@ def tune(name, estimator, space, n_iter, prep):
     fitted[name] = search.best_estimator_
     best = {k.replace("model__", ""): (round(float(v), 4) if isinstance(v, (float, np.floating)) else int(v) if isinstance(v, np.integer) else v)
             for k, v in search.best_params_.items()}
-    print(f"{name}: CV RMSE = {-search.best_score_:.1f} kg/ha  ({train_time[name]:.0f}s)\n  best params: {best}")
+    print(f"{name}: validation RMSE = {-search.best_score_:.1f} kg/ha  ({train_time[name]:.0f}s)\n  best params: {best}")
     results.append(evaluate(name, y_test.values, search.best_estimator_.predict(X_test)))
     return best
 
-best_params = {}
 best_params["Random Forest"] = tune("Random Forest",
     RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=2),
     {"n_estimators": randint(300, 801), "max_depth": [6, 8, 10, 14, 20, None], "min_samples_leaf": randint(1, 11),
-     "max_features": uniform(0.3, 0.5), "max_samples": uniform(0.6, 0.4)}, n_iter=20, prep=onehot_preprocessor())
-
-# %% [markdown]
-# ### 7.2 XGBoost (gradient boosting, level-wise trees)
-# | Parameter | Range | Reasoning |
-# |---|---|---|
-# | `learning_rate` | 0.01–0.15 (log) | small steps + more trees generalise better on small data |
-# | `n_estimators` | 300–1500 | paired with the learning rate (smaller rate → more trees) |
-# | `max_depth` | 2–6 | shallow trees: interactions here are low-order (district × season × history) |
-# | `subsample`, `colsample_bytree` | 0.6–1.0 | stochastic boosting reduces over-fitting |
-# | `min_child_weight` | 1–10 | stops splits on very few district-seasons |
-# | `reg_lambda`, `reg_alpha` | L2 0.1–20, L1 0–2 | weight regularisation for a small, noisy dataset |
-
-# %%
+     "max_features": uniform(0.3, 0.5), "max_samples": uniform(0.6, 0.4)}, n_iter=NI(20), prep=onehot_preprocessor())
 best_params["XGBoost"] = tune("XGBoost",
     XGBRegressor(random_state=RANDOM_STATE, n_jobs=2, tree_method="hist", objective="reg:squarederror"),
     {"n_estimators": randint(300, 1501), "learning_rate": loguniform(0.01, 0.15), "max_depth": randint(2, 7),
      "subsample": uniform(0.6, 0.4), "colsample_bytree": uniform(0.6, 0.4), "min_child_weight": randint(1, 11),
-     "reg_lambda": loguniform(0.1, 20), "reg_alpha": uniform(0, 2)}, n_iter=30, prep=onehot_preprocessor())
-
-# %% [markdown]
-# ### 7.3 LightGBM (gradient boosting, leaf-wise trees)
-# LightGBM grows trees leaf-wise, so `num_leaves` (not depth) is the main complexity control; with < 2k rows it must be small (8–40) and `min_child_samples` must be raised to avoid over-fitting.
-
-# %%
+     "reg_lambda": loguniform(0.1, 20), "reg_alpha": uniform(0, 2)}, n_iter=NI(30), prep=onehot_preprocessor())
 best_params["LightGBM"] = tune("LightGBM",
     LGBMRegressor(random_state=RANDOM_STATE, n_jobs=2, verbose=-1),
     {"n_estimators": randint(300, 1501), "learning_rate": loguniform(0.01, 0.15), "num_leaves": randint(8, 41),
      "min_child_samples": randint(10, 51), "subsample": uniform(0.6, 0.4), "subsample_freq": [1],
-     "colsample_bytree": uniform(0.6, 0.4), "reg_lambda": loguniform(0.1, 20)}, n_iter=30, prep=onehot_preprocessor())
-
-# %% [markdown]
-# ### 7.4 CatBoost (gradient boosting with native categorical handling)
-# Our two categorical features (25 districts, 2 seasons) are handled by CatBoost's **ordered target statistics** instead of one-hot encoding, and its symmetric (oblivious) trees are naturally regularised. `depth` 4–8, `l2_leaf_reg` 1–15.
-
-# %%
+     "colsample_bytree": uniform(0.6, 0.4), "reg_lambda": loguniform(0.1, 20)}, n_iter=NI(30), prep=onehot_preprocessor())
 best_params["CatBoost"] = tune("CatBoost",
     CatBoostSK(random_state=RANDOM_STATE, thread_count=2),
     {"iterations": randint(400, 1201), "learning_rate": loguniform(0.02, 0.15), "depth": randint(4, 9),
-     "l2_leaf_reg": loguniform(1, 15), "bagging_temperature": uniform(0, 1)}, n_iter=12, prep=catboost_preprocessor())
+     "l2_leaf_reg": loguniform(1, 15), "bagging_temperature": uniform(0, 1)}, n_iter=NI(12), prep=catboost_preprocessor())
 
-# %% [markdown]
-# ### 7.5 Stacking ensemble
-# A **stacking regressor** combines the four tuned ensembles. Their out-of-fold predictions are fed to a **Ridge** meta-learner (with built-in CV for its alpha), which learns how much to trust each base model.
-# Bagging (RF) and boosting (XGB/LGBM/CatBoost) make different kinds of errors, which is what stacking exploits.
-# *Note:* `StackingRegressor` requires a partitioning CV, so `KFold(shuffle=False)` (contiguous time blocks) is used to build the meta-features.
-
-# %%
 stack = StackingRegressor(
     estimators=[(n.replace(" ", "_"), fitted[n]) for n in ["Random Forest", "XGBoost", "LightGBM", "CatBoost"]],
     final_estimator=RidgeCV(alphas=np.logspace(-2, 3, 20)), cv=KFold(5, shuffle=False), n_jobs=1)
@@ -336,36 +363,36 @@ cv_scores["Stacking"] = -cross_val_score(stack, X_train, y_train, cv=tscv, scori
 t0 = time.time(); stack.fit(X_train, y_train); train_time["Stacking"] = time.time() - t0
 fitted["Stacking"] = stack
 results.append(evaluate("Stacking", y_test.values, stack.predict(X_test)))
-print("Meta-learner weights:", dict(zip([e[0] for e in stack.estimators], stack.final_estimator_.coef_.round(3))))
-print(f"Stacking CV RMSE = {cv_scores['Stacking']:.1f}")
+print(f"Stacking: validation RMSE = {cv_scores['Stacking']:.1f}")
 
 # %% [markdown]
-# ## 8. Model comparison
-# * **CV RMSE** (training period, forward-chaining) is used to *select* the model – choosing on the test set would be cheating.
-# * **Test metrics** (2016–2023) show how it would have performed in reality. RMSE is also reported **excluding 2022**, to separate normal-year accuracy from the fertilizer-ban shock.
+# ## 9. Evaluation and comparison
+# **Metrics (regression task):** RMSE (penalises large misses – important for food-security planning), MAE (typical error in kg/ha), MAPE (relative error), R² (variance explained), and the share of forecasts within ±10 % of the actual yield (an operational "good enough" rate). RMSE is also reported **excluding 2022** to separate normal-year accuracy from the fertilizer-ban shock.
+# *Validation RMSE* comes from the forward-chaining folds (used for tuning); *test* metrics come from the untouched 2016–2023 seasons.
 
 # %%
 res = pd.DataFrame(results).set_index("model")
-res.insert(0, "CV RMSE (train)", pd.Series(cv_scores))
+res.insert(0, "Validation RMSE", pd.Series(cv_scores))
 res["fit time (s)"] = pd.Series(train_time)
-res = res.sort_values("CV RMSE (train)")
+res = res.sort_values("RMSE")
 res.round(2)
 
 # %%
-fig, axes = plt.subplots(1, 2, figsize=(13, 4.2))
+BASELINES = ["Persistence (same season LY)", "Moving average (last 4)", "Linear regression"]
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.4))
 r = res.sort_values("RMSE")
-cols = ["#c0c0c0" if n in ["Persistence (same season LY)", "Moving average (last 4)", "Linear regression"] else "#2e8b57" for n in r.index]
+cols = ["#d4a017" if n == "EBM (new)" else "#c0c0c0" if n in BASELINES else "#2e8b57" for n in r.index]
 axes[0].barh(r.index, r["RMSE"], color=cols); axes[0].invert_yaxis()
 axes[0].barh(r.index, r["RMSE excl. 2022"], color="none", edgecolor="black", hatch="//", label="excl. 2022")
-axes[0].set_xlabel("Test RMSE (kg/ha) – lower is better"); axes[0].legend()
-axes[1].barh(r.index, r["R2"], color=cols); axes[1].invert_yaxis(); axes[1].set_xlabel("Test R²")
+for y, v in enumerate(r["RMSE"]): axes[0].text(v + 8, y, f"{v:.0f}", va="center", fontsize=8)
+axes[0].set_xlim(0, 980); axes[0].set_xlabel("Test RMSE (kg/ha) – lower is better"); axes[0].legend(loc="upper right")
+axes[1].barh(r.index, r["Validation RMSE"], color=cols); axes[1].invert_yaxis(); axes[1].set_xlabel("Validation RMSE (kg/ha)")
 axes[1].set_yticklabels([])
-fig.suptitle("Test performance 2016–2023 (grey = existing approaches, green = ensembles)")
+fig.suptitle("Gold = EBM (new algorithm), green = ensembles taught in lectures, grey = existing approaches")
 savefig("05_model_comparison")
 
 # %%
-BEST = res.index[0]
-print("Selected model (lowest CV RMSE):", BEST)
+BEST = "EBM (new)"
 best_model = fitted[BEST]
 test_pred = best_model.predict(X_test)
 by_year = test.assign(pred=test_pred, err=test_pred - y_test).groupby(["Year", "Season"]).agg(
@@ -376,129 +403,158 @@ by_year
 fig, axes = plt.subplots(1, 2, figsize=(13, 4.3))
 axes[0].scatter(y_test, test_pred, s=10, alpha=0.6, c=(test["Year"] == 2022).map({True: "red", False: "#2e8b57"}))
 lims = [y_test.min() - 200, y_test.max() + 200]; axes[0].plot(lims, lims, "k--", lw=1)
-axes[0].set_xlabel("Actual yield (kg/ha)"); axes[0].set_ylabel("Predicted"); axes[0].set_title(f"{BEST}: actual vs predicted (red = 2022)")
+axes[0].set_xlabel("Actual yield (kg/ha)"); axes[0].set_ylabel("Predicted"); axes[0].set_title("EBM: actual vs predicted on test (red = 2022)")
 by_year[["actual", "predicted"]].plot(ax=axes[1], marker="o")
 axes[1].set_xticks(range(len(by_year))); axes[1].set_xticklabels([f"{y} {s[0]}" for y, s in by_year.index], rotation=60)
 axes[1].set_ylabel("Mean district yield (kg/ha)"); axes[1].set_title("Mean by season (M = Maha, Y = Yala)")
 savefig("06_best_model_fit")
 
 # %% [markdown]
-# ### Interpreting the comparison
-# * **Every ensemble beats the existing approaches in cross-validation**: CV RMSE ≈ 425–437 kg/ha vs 442 (moving average), 477 (persistence) and 513 (linear regression) – about **17 % lower error than linear regression**.
-# * **On the 2016–2023 test period** the selected LightGBM reduces RMSE by **≈16 % vs persistence** (626 vs 742 kg/ha) and **≈9 % vs the moving average**; excluding the 2022 shock the gain vs persistence is **≈22 %** (455 vs 583 kg/ha). About 60 % of district-season forecasts are within ±10 % of the actual yield.
-# * The advantage over **linear regression shrinks on the test period** (626 vs 639). Reason: 2019–2021 brought *record* yields, outside the 1979–2015 training range. Tree ensembles predict averages of training leaves and **cannot extrapolate a trend**, whereas a linear `Year` term can. This is a real limitation and is why the final model is **retrained on data up to 2023** before deployment, and why monitoring/retraining (MLOps) matters.
-# * **Stacking** gives the best raw test RMSE (608) by mixing RF + CatBoost errors, but its CV score is slightly worse than LightGBM and it is ~4× more complex to deploy and explain. Following the rule "select on validation, report on test", **LightGBM** is chosen; Stacking is a close alternative.
-# * **2022 (fertilizer ban)**: LightGBM's errors are 2.5–4 times larger than in normal seasons (MAE ≈ 1,400 kg/ha in Maha and ≈ 900 in Yala vs ≈ 350 otherwise, see the table above), and every model, including the baselines, over-predicts that year. Shocks are not predictable from history alone.
-
-# %% [markdown]
-# ### Strengths and limitations of each model (interpreted from the results above)
+# ### What the results indicate
+# * **Validation (forward-chaining folds, 1979–2015):** the tree ensembles score 425–437 kg/ha and EBM 441 kg/ha, about 4 % above the best (LightGBM). EBM is 14 % better than linear regression (513) and 8 % better than persistence (477), but only level with the 4-season moving average (442) on these older years.
+# * **Test (unseen 2016–2023):** EBM's RMSE is **623 kg/ha**: better than LightGBM (626), XGBoost (633) and linear regression (639), **9 % better than the moving average (685)** and **16 % better than persistence (742)**, and within 2.5 % of the best model (Stacking, 608). Its MAE (449 kg/ha) is second only to Stacking, and **60 % of its district-season forecasts are within ±10 %** of the actual yield (MAPE 12.9 %).
+# * **Excluding the 2022 shock**, EBM's RMSE is 457 kg/ha against 583 for persistence (−22 %).
+# * **What this indicates:** the new glass-box model reaches the accuracy of the black-box boosted ensembles on future seasons. Interpretability costs at most ~4 % on validation and nothing on test, so EBM is the model deployed in the app.
+# * **2022 (fertilizer ban):** EBM's mean error jumps to about 1,400 kg/ha in Maha and 900 kg/ha in Yala, against 200–540 kg/ha in the other test seasons (table above). Every model, including the baselines, over-predicts that year, because the shock is not in any sowing-time feature.
+# * **Unseen hold-out case:** for Polonnaruwa Yala 2023 the final EBM predicts 4,731 kg/ha against an actual 4,918 kg/ha (−3.8 %; section 12).
+#
+# **Strengths and limitations of each model**
 # | Model | Strengths | Limitations |
 # |---|---|---|
-# | Persistence / moving average | No training, transparent, already "good" because yields are persistent | Cannot react to sown area, irrigation mix or trend; lags one season behind every change |
-# | Linear regression | Fast, coefficients readable, captures trend | Assumes additive linear effects; unstable with collinear shares/lags; no interactions (e.g. Yala × rain-fed) |
-# | Random Forest | Robust, little tuning sensitivity, handles collinearity and missing-pattern noise | Cannot extrapolate beyond the training range (tree leaves are averages) – a problem for an upward-trending target; larger model file |
-# | XGBoost | Strong accuracy, regularisation (L1/L2, subsampling), fast with `hist` | Many interacting hyperparameters; needs one-hot for districts; can over-fit small data without careful tuning |
-# | LightGBM | Fastest training, leaf-wise trees capture interactions | Leaf-wise growth over-fits easily on < 2k rows – needed small `num_leaves` and large `min_child_samples` |
-# | CatBoost | Native categorical handling (no one-hot), ordered boosting reduces target leakage, good defaults-region | Slowest to train; less transparent encoding of districts |
-# | Stacking | Combines bagging + boosting errors; usually the most stable | Most complex to deploy and explain; gain over the best single model is small; meta-learner needs careful CV |
-#
-# **Common limitation:** none of the models can foresee a policy shock such as the 2021 fertilizer ban – the information is simply not in the features. Errors in 2022 are therefore much larger for *every* model, including the baselines.
+# | Persistence / moving average | No training, transparent | Ignores irrigation mix, sown area and trend; lags every change |
+# | Linear regression | Fast, readable, extrapolates the trend | No curves or interactions; unstable with collinear shares; worst validation score |
+# | Random Forest | Robust, low tuning sensitivity | Black box; cannot extrapolate; large model file |
+# | XGBoost / LightGBM | Best validation scores; strong regularisation | Black box; many interacting hyperparameters; need one-hot districts |
+# | CatBoost | Native categorical handling; good test score | Slow; black box |
+# | Stacking | Best test RMSE | Most complex to deploy and explain; small gain |
+# | **EBM (new)** | **Glass box with exact explanations; boosted-tree-level test accuracy; native categorical and missing-value handling** | **Slowest to train (bagging × cyclic boosting); like trees, its piecewise-constant curves cannot extrapolate beyond the training range; validation ~4 % behind LightGBM** |
 
 # %% [markdown]
-# ## 9. Explainability (post-hoc, as covered in the lectures)
-# * **SHAP** (Shapley additive explanations, from cooperative game theory) – *global* view: which features drive yield predictions across all districts and seasons, and in which direction; plus a *local* waterfall for a single prediction.
-# * **LIME** (Local Interpretable Model-agnostic Explanations) – fits a simple weighted linear surrogate model around one instance to explain that single prediction.
+# ## 10. Explainability and interpretation
+# At least one XAI method is required; four complementary methods are used:
+# 1. **EBM global explanation (intrinsic)** – term importances and the learned shape functions: *what the model has learned*.
+# 2. **Partial Dependence Plots (PDP)** – model-agnostic average effect of a feature, as a cross-check of the shape functions.
+# 3. **SHAP on the best tree benchmark (post-hoc)** – do two very different models learn the same drivers?
+# 4. **Local explanations for one unseen case** – EBM's exact additive breakdown, cross-checked with **LIME**.
 #
-# TreeSHAP needs a single tree model, so SHAP is computed on the best **tree-based** model; LIME is model-agnostic and explains the final selected model directly.
+# ### 10.1 Which features are most influential (EBM term importance)
+
+# %%
+ebm = best_model
+imp = pd.Series(ebm.term_importances(), index=ebm.term_names_).sort_values()
+fig, ax = plt.subplots(figsize=(7.5, 5))
+ax.barh(imp.index, imp.values, color=["#d4a017" if "&" in n else "#2e8b57" for n in imp.index])
+ax.set_xlabel("mean |contribution| to the forecast (kg/ha)")
+ax.set_title("EBM global term importance (gold = pairwise interactions)")
+savefig("07_ebm_importance")
+imp.sort_values(ascending=False).round(1).to_frame("importance (kg/ha)")
+
+# %% [markdown]
+# ### 10.2 What the model has learned: shape functions
+# Each panel below **is** part of the model: the forecast is the intercept plus the value read from every curve. Shaded bands show the variation across the bagged models (uncertainty).
+
+# %%
+g = ebm.explain_global()
+def shape(term):
+    d = g.data(ebm.term_names_.index(term))
+    return d
+fig, axes = plt.subplots(2, 3, figsize=(14, 7.2))
+for ax, term in zip(axes.ravel()[:5], ["yield_same_season_ly", "yield_avg_last4", "share_rainfed", "share_major", "Year"]):
+    d = shape(term); edges = np.asarray(d["names"], dtype=float); sc = np.asarray(d["scores"])
+    lo, hi = np.asarray(d["lower_bounds"]), np.asarray(d["upper_bounds"])
+    x = np.repeat(edges, 2)[1:-1]; y = np.repeat(sc, 2)
+    ax.plot(x, y, color="#1e4d2b"); ax.fill_between(x, np.repeat(lo, 2), np.repeat(hi, 2), color="#97bc62", alpha=0.35)
+    ax.axhline(0, color="k", lw=0.5); ax.set_title(term); ax.set_ylabel("contribution (kg/ha)")
+d = shape("District"); dd = pd.Series(d["scores"], index=d["names"]).sort_values()
+axes[1, 2].barh(dd.index, dd.values, color=["#c0392b" if v < 0 else "#2e8b57" for v in dd.values]); axes[1, 2].tick_params(axis="y", labelsize=6.5)
+axes[1, 2].set_title("District"); axes[1, 2].set_xlabel("contribution (kg/ha)")
+fig.suptitle("EBM shape functions – the model's learned effect of each feature")
+savefig("08_ebm_shapes")
+
+# %%
+inter = [t for t in ebm.term_names_ if "&" in t]
+if inter:
+    # show the strongest *interpretable numeric* interaction (time x irrigation if the model found one)
+    numeric = [t for t in inter if not any(c in t for c in CAT_FEATURES)]
+    pick = [t for t in numeric if t.startswith("Year &")] or numeric or inter
+    top = max(pick, key=lambda t: ebm.term_importances()[ebm.term_names_.index(t)])
+    d = shape(top)
+    print("Interactions found:", inter, "| plotted:", top)
+    fig, ax = plt.subplots(figsize=(6, 3.6))
+    left, right = d["left_names"], d["right_names"]
+    im = ax.imshow(np.asarray(d["scores"]).T, origin="lower", aspect="auto", cmap="RdBu_r",
+                   extent=[0, len(left) - 1, 0, len(right) - 1] if not isinstance(left[0], str) else None)
+    a, b = top.split(" & ")
+    ax.set_xlabel(a); ax.set_ylabel(b); plt.colorbar(im, label="contribution (kg/ha)")
+    if not isinstance(left[0], str):
+        ax.set_xticks(np.linspace(0, len(left) - 1, 5)); ax.set_xticklabels([f"{float(v):.0f}" if float(v) > 10 else f"{float(v):.2f}" for v in np.asarray(left, float)[np.linspace(0, len(left) - 1, 5).astype(int)]])
+    if not isinstance(right[0], str):
+        ax.set_yticks(np.linspace(0, len(right) - 1, 5)); ax.set_yticklabels([f"{float(v):.2f}" if float(v) <= 10 else f"{float(v):.0f}" for v in np.asarray(right, float)[np.linspace(0, len(right) - 1, 5).astype(int)]])
+    ax.set_title(f"Interaction: {top}")
+    savefig("08b_ebm_interaction")
+
+# %% [markdown]
+# ### 10.3 Partial Dependence Plots (model-agnostic cross-check)
+
+# %%
+from sklearn.inspection import PartialDependenceDisplay
+fig, ax = plt.subplots(1, 3, figsize=(13, 3.6))
+PartialDependenceDisplay.from_estimator(ebm, data[FEATURES].reset_index(drop=True).astype({"Year": float}), ["yield_avg_last4", "share_rainfed", "Year"],
+                                        kind="both", subsample=150, random_state=RANDOM_STATE, ax=ax,
+                                        ice_lines_kw={"color": "#97bc62", "alpha": 0.25}, pd_line_kw={"color": "#1e4d2b", "lw": 2.5})
+fig.suptitle("Partial dependence (dark line) and individual conditional expectation (light lines) – EBM tuned on 1979–2015, all seasons")
+savefig("09_pdp")
+
+# %% [markdown]
+# ### 10.4 Post-hoc cross-check: SHAP on the best tree benchmark
+# If a completely different model (gradient-boosted trees) explained with a different method (SHAP) finds the same drivers, the conclusions are more robust.
 
 # %%
 tree_models = [m for m in res.index if m in ["Random Forest", "XGBoost", "LightGBM", "CatBoost"]]
-EXPLAIN = tree_models[0]
-exp_pipe = fitted[EXPLAIN]
-prep, est = exp_pipe.named_steps["prep"], exp_pipe.named_steps["model"]
-Xt_test = prep.transform(X_test)
-feat_names = list(prep.get_feature_names_out())
-Xt_test = pd.DataFrame(np.asarray(Xt_test), columns=feat_names)
-if EXPLAIN == "CatBoost":
+TREE = min(tree_models, key=lambda m: cv_scores[m])
+prep_t, est_t = fitted[TREE].named_steps["prep"], fitted[TREE].named_steps["model"]
+feat_names = list(prep_t.get_feature_names_out())
+Xt_test = pd.DataFrame(np.asarray(prep_t.transform(X_test)), columns=feat_names)
+if TREE == "CatBoost":
     Xt_test[NUM_FEATURES] = Xt_test[NUM_FEATURES].astype(float)
-explainer = shap.TreeExplainer(est.model_ if EXPLAIN == "CatBoost" else est)
-sv = explainer(Xt_test)
-print("SHAP explained model:", EXPLAIN)
-
-# group one-hot columns back to their original feature so 'District' is one feature
-def group_shap(values, names):
-    df = pd.DataFrame(values, columns=names)
-    groups = {n: ("District" if n.startswith("District_") else "Season" if n.startswith("Season_") else n) for n in names}
-    return df.T.groupby(pd.Series(groups)).sum().T
-
-shap_grouped = group_shap(sv.values, feat_names)
-imp = shap_grouped.abs().mean().sort_values()
-fig, ax = plt.subplots(figsize=(7, 4.5))
-ax.barh(imp.index, imp.values, color="#2e8b57"); ax.set_xlabel("mean |SHAP value| (kg/ha)")
-ax.set_title(f"Global feature importance – {EXPLAIN} (SHAP, test set)")
-savefig("07_shap_importance")
-
-# %%
+sv = shap.TreeExplainer(est_t.model_ if TREE == "CatBoost" else est_t)(Xt_test)
 num_idx = [feat_names.index(f) for f in NUM_FEATURES]
-raw_test_num = X_test[NUM_FEATURES].reset_index(drop=True)
 plt.figure()
-shap.summary_plot(sv.values[:, num_idx], raw_test_num, feature_names=NUM_FEATURES, show=False, plot_size=(8, 5))
-plt.title("SHAP beeswarm (numeric features, original units)")
-savefig("08_shap_beeswarm")
-
-# %%
-fig, axes = plt.subplots(1, 3, figsize=(14, 3.8))
-for ax, f in zip(axes, ["yield_avg_last4", "share_rainfed", "Year"]):
-    ax.scatter(raw_test_num[f], sv.values[:, feat_names.index(f)], s=8, alpha=0.6,
-               c=(X_test["Season"] == "YALA").map({True: "#d2691e", False: "#2e8b57"}).values)
-    ax.axhline(0, color="k", lw=0.6); ax.set_xlabel(f); ax.set_ylabel("SHAP value (kg/ha)")
-axes[0].set_title("green = Maha, orange = Yala", fontsize=9)
-fig.suptitle("SHAP dependence: how a feature's value changes its contribution")
-savefig("09_shap_dependence")
+shap.summary_plot(sv.values[:, num_idx], X_test[NUM_FEATURES].reset_index(drop=True), feature_names=NUM_FEATURES, show=False, plot_size=(8, 5))
+plt.title(f"SHAP beeswarm – {TREE} (benchmark), test set")
+savefig("12_shap_benchmark")
+def grouped(values, names):
+    df = pd.DataFrame(values, columns=names)
+    grp = {n: ("District" if n.startswith("District_") else "Season" if n.startswith("Season_") else n) for n in names}
+    return df.T.groupby(pd.Series(grp)).sum().T
+shap_rank = grouped(sv.values, feat_names).abs().mean().rank(ascending=False)
+ebm_main = pd.Series(ebm.term_importances(), index=ebm.term_names_)[FEATURES].rank(ascending=False)
+pd.DataFrame({"EBM rank": ebm_main, f"SHAP rank ({TREE})": shap_rank}).sort_values("EBM rank").astype(int)
 
 # %% [markdown]
-# **Interpreting the SHAP results**
-# * The district's **recent yield history** (`yield_avg_last4`, `yield_same_season_ly`) is the strongest driver: a district that averaged high yields in the last four seasons is predicted high again. The relationship is close to linear — yields are persistent.
-# * **`District` itself adds very little** once history and irrigation mix are known: the location effect seen in the EDA box-plot is already *encoded* in each district's past yields and its irrigation shares. This is a useful finding – the model generalises through agronomic drivers rather than memorising district names.
-# * **`share_rainfed`** has a negative effect: the more of the sown area depends on rain alone, the lower the expected yield — consistent with agronomy (no water control, more drought/flood risk). This is stronger in **Yala**, which receives less rain in the dry zone.
-# * **`Year`** captures the long-term technology trend (better varieties and inputs), pushing recent seasons up.
-# * Sown area change and last season's harvest ratio have smaller, mostly non-linear effects (they matter mainly in abnormal seasons).
-#
-# The model's reasoning therefore matches domain knowledge – an important trust check (no leakage or spurious feature dominating).
-
-# %% [markdown]
-# ### 9.2 Local explanation of one prediction: the held-out sample (Polonnaruwa, Yala 2023)
-# For deployment the selected model is **retrained on all available seasons (1979–2023, except the held-out sample)** with the tuned hyperparameters, so it has seen the most recent yield levels. The local explanations below explain *this final model*, i.e. exactly the prediction the app will give.
+# ### 10.5 Local explanation of one unseen case: Polonnaruwa, Yala 2023
+# For deployment the EBM is **retrained on all available seasons (1979–2023, except the held-out sample)** with the tuned hyperparameters. EBM's local explanation is **exact**: intercept + the listed contributions = the prediction.
 
 # %%
 from sklearn.base import clone
 final_model = clone(best_model)
 final_model.fit(data[FEATURES], data[TARGET])
-if BEST == EXPLAIN:
-    prep, est = final_model.named_steps["prep"], final_model.named_steps["model"]
-    explainer = shap.TreeExplainer(est.model_ if EXPLAIN == "CatBoost" else est)
-x_hold = holdout[FEATURES]
-xh = pd.DataFrame(np.asarray(prep.transform(x_hold)), columns=feat_names)
-if EXPLAIN == "CatBoost":
-    xh[NUM_FEATURES] = xh[NUM_FEATURES].astype(float)
-sv_h = explainer(xh)
-g = group_shap(sv_h.values, feat_names).iloc[0]
-disp = {f: (holdout[f].iloc[0] if f in holdout else "") for f in g.index}
-expl = shap.Explanation(values=g.values, base_values=float(np.ravel(sv_h.base_values)[0]),
-                        data=np.array([disp[f] if isinstance(disp[f], str) else round(float(disp[f]), 2) for f in g.index], dtype=object),
-                        feature_names=list(g.index))
-plt.figure(figsize=(9, 6))
-shap.plots.waterfall(expl, max_display=12, show=False)
-plt.title(f"SHAP waterfall – Polonnaruwa Yala 2023 (final {EXPLAIN})")
-savefig("10_shap_waterfall")
-
-# %% [markdown]
-# **Reading the waterfall.** Starting from the average prediction (≈3,520 kg/ha), Polonnaruwa's high recent yields (+≈320), zero rain-fed area (+≈220) and 88 % major irrigation (+≈145) push the forecast up to ≈4,225 kg/ha.
-# Notice that **`Year = 2023` pulls the forecast *down***: after retraining on 2022, the model has learned that the most recent years were low (fertilizer ban). In reality yields recovered in 2023 (actual 4,918 kg/ha), so this is precisely why the forecast is ~14 % too low. SHAP turns an unexplained error into a diagnosable one – exactly the "debugging" and "trust calibration" uses of XAI discussed in the lecture.
-# In the dependence plot above, `Year`'s SHAP value is also flat across 2016–2023: trees cannot extend the upward trend beyond the training data.
-
-# %% [markdown]
-# ### 9.3 LIME explanation of the same sample (final selected model)
+loc = final_model.explain_local(holdout[FEATURES]).data(0)
+contrib = pd.Series(loc["scores"], index=loc["names"])
+intercept = float(final_model.intercept_)
+pred_h = float(final_model.predict(holdout[FEATURES])[0])
+print(f"intercept {intercept:,.0f} + contributions {contrib.sum():+,.0f} = {intercept + contrib.sum():,.0f}  (model prediction {pred_h:,.0f})")
+top = contrib.reindex(contrib.abs().sort_values(ascending=True).index).tail(12)
+vals = {f: holdout[f].iloc[0] for f in FEATURES}
+lab = [f"{n} = {int(vals[n])}" if n == "Year" else f"{n} = {vals[n]:.2f}" if n in vals and not isinstance(vals[n], str) and abs(vals[n]) < 10 else
+       f"{n} = {vals[n]:,.0f}" if n in vals and not isinstance(vals[n], str) else f"{n} = {vals[n]}" if n in vals else n for n in top.index]
+fig, ax = plt.subplots(figsize=(8.5, 5.2))
+ax.barh(lab, top.values, color=["#2e8b57" if v > 0 else "#c0392b" for v in top.values]); ax.axvline(0, color="k", lw=0.6)
+ax.set_xlim(min(top.min(), 0) - 70, max(top.max(), 0) + 70)
+for y, v in enumerate(top.values): ax.text(v + (8 if v >= 0 else -8), y, f"{v:+.0f}", va="center", ha="left" if v >= 0 else "right", fontsize=8)
+ax.set_xlabel("contribution to the forecast (kg/ha)")
+ax.set_title(f"EBM local explanation – Polonnaruwa Yala 2023\nintercept {intercept:,.0f} + contributions = {pred_h:,.0f} kg/ha (actual {holdout[TARGET].iloc[0]:,.0f})")
+savefig("10_ebm_local")
 
 # %%
 cat_maps = {c: sorted(train[c].unique()) for c in CAT_FEATURES}
@@ -512,7 +568,6 @@ def predict_from_encoded(arr):
     for c in CAT_FEATURES:
         df[c] = df[c].round().astype(int).clip(0, len(cat_maps[c]) - 1).map(dict(enumerate(cat_maps[c])))
     return final_model.predict(df[FEATURES])
-
 enc_train = encode(train)
 lime_exp = LimeTabularExplainer(
     enc_train.fillna(enc_train.median()).values, feature_names=FEATURES, mode="regression",
@@ -520,27 +575,87 @@ lime_exp = LimeTabularExplainer(
     categorical_names={FEATURES.index(c): cat_maps[c] for c in CAT_FEATURES},
     discretize_continuous=True, random_state=RANDOM_STATE)
 x_enc = encode(holdout).fillna(enc_train.median()).values[0]
-le = lime_exp.explain_instance(x_enc, predict_from_encoded, num_features=8, num_samples=3000)
+le = lime_exp.explain_instance(x_enc, predict_from_encoded, num_features=8, num_samples=2000)
 print(f"LIME local surrogate R² = {le.score:.2f} | surrogate prediction = {le.local_pred[0]:.0f} kg/ha")
 fig = le.as_pyplot_figure(); fig.set_size_inches(8, 4.2)
-plt.title(f"LIME – Polonnaruwa Yala 2023 (final {BEST})")
+plt.title("LIME – Polonnaruwa Yala 2023 (final EBM)")
 savefig("11_lime")
 pd.DataFrame(le.as_list(), columns=["condition", "effect (kg/ha)"]).round(1)
 
 # %% [markdown]
-# **SHAP vs LIME on the same case.** Both agree on the main story for Polonnaruwa: a high recent yield history, no rain-fed area and a large major-irrigation share push the forecast well above average, while the Yala season pulls it slightly down.
-# They **disagree on `Year`**: LIME says "Year > 2006" helps, SHAP says 2023 hurts. LIME discretises features into coarse bins and fits a local linear surrogate on perturbed samples (local R² ≈ 0.63 here, so it is only an approximation and can vary between runs), so it compares "recent vs old years". SHAP values are exact additive contributions for tree models and capture the specific 2022–23 dip. Using both is a useful cross-check, and their disagreement is itself informative.
+# ### 10.6 Interpretation: what the model learned and whether it matches domain knowledge
+# **Which features are most influential?** The EBM's largest terms are last year's same-season yield (≈162 kg/ha average contribution), Year (≈158), the rain-fed share of the sown area (≈138), District (≈113), the 4-season average yield (≈104), the major-irrigation share (≈91) and Season (≈73). Pairwise interactions are all small (≤ 20 kg/ha), so district yield is almost an *additive* combination of history, irrigation and trend. That is exactly why a GAM can match boosted trees here.
+#
+# **What has the model learned? (shape functions)**
+# * **Yield history:** contributions rise almost linearly with the previous same-season yield and the 4-season average. Good districts tend to stay good, which is yield persistence.
+# * **Rain-fed share:** a clear *downward* curve, from about +200 kg/ha when nothing is rain-fed to about −150 to −250 kg/ha when most of the area depends on rain alone. That is a gap of roughly 400 kg/ha caused purely by water security.
+# * **Major-irrigation share:** flat up to about 60 %, then a sharp rise of up to +250 kg/ha for districts dominated by large irrigation schemes (assured water from reservoirs).
+# * **Year:** the long-term technology trend appears as steps, with low levels in the 1980s–90s and successive rises through the 2000s and 2010s (newer rice varieties, the expanded fertilizer subsidy, mechanisation).
+# * **District:** once history and irrigation are known, the district terms are *adjustments*. They are positive for dry-zone irrigated districts such as Hambantota, Polonnaruwa and Ampara, and negative for Jaffna and some wet-zone districts.
+# * **Season:** Yala is predicted lower than Maha, as expected for the drier, tank-dependent season.
+#
+# **Do the methods agree?** The PDP/ICE curves have the same direction and shape as the EBM curves. SHAP on LightGBM, a completely different model explained post hoc, puts the same features at the top: yield history, Year, rain-fed share and major share. The only notable disagreement is **District**, ranked 4th by EBM but 12th by LightGBM-SHAP. LightGBM spreads district identity over 25 one-hot columns and mostly lets the correlated yield-history features carry it, while EBM gives District its own term. The location effect is real in both models; they assign the credit to different but correlated features.
+#
+# **Local explanation (Polonnaruwa, Yala 2023):** 3,519 kg/ha (average) + recent Year (+226) + no rain-fed area (+223) + high 4-season average (+207) + 88 % major irrigation (+174) + Year × rain-fed (+171) + last year's same-season yield (+158) + district (+144) − Yala season (−78) − small terms = **4,731 kg/ha** (actual 4,918). LIME's surrogate (local R² ≈ 0.5) lists the same drivers with the same signs. Because the EBM is additive, its breakdown is exact rather than approximate.
+#
+# **Does it align with domain knowledge?** Yes. Water security (major irrigation up, rain-fed down), persistence of district performance, the long-run technology trend and a lower Yala season are all well-established features of Sri Lankan paddy production. No suspicious feature (for example, a leakage variable) dominates. These are the checks that let an agricultural planner *trust* the forecast (lecture: transparency, trust calibration, debugging).
 
 # %% [markdown]
-# ## 10. Save the model and run inference on the unseen sample
-# The final (retrained) model is saved with `pickle` together with the metadata the front-end needs.
+# ## 11. Bias and fairness check
+# Yield forecasts feed decisions (fertilizer, purchasing, relief) that affect farmers by district. A model that is systematically worse – or systematically optimistic – for some districts could disadvantage them.
+# We therefore break the EBM's test errors down by **district** and by **district group**, using the data itself to form groups:
+# * **Mostly irrigated:** > 50 % of sown area under major irrigation on average
+# * **Mostly rain-fed:** > 50 % rain-fed
+# * **Mixed:** the rest
+# * **Northern, conflict-affected:** Jaffna, Kilinochchi, Mannar, Mullativu, Vavuniya (seasons missing during the civil-war years → shorter, gappier history)
 
 # %%
+NORTH = ["Jaffna", "Kilinochchi", "Mannar", "Mullativu", "Vavuniya"]
+shares = model_df.groupby("District")[["share_major", "share_rainfed"]].mean()
+def group_of(d):
+    if d in NORTH: return "Northern, conflict-affected"
+    if shares.loc[d, "share_major"] > 0.5: return "Mostly irrigated"
+    if shares.loc[d, "share_rainfed"] > 0.5: return "Mostly rain-fed"
+    return "Mixed"
+ev = test.assign(pred=test_pred, err=test_pred - y_test, ape=np.abs(test_pred - y_test) / y_test * 100)
+ev["group"] = ev["District"].map(group_of)
+ev_n = ev[ev.Year != 2022]
+grp = ev_n.groupby("group").agg(districts=("District", "nunique"), MAPE=("ape", "mean"), bias_kg_ha=("err", "mean"),
+                                within_10pct=("ape", lambda a: (a <= 10).mean() * 100)).round(1)
+print("Test seasons excluding 2022 (bias > 0 means the model over-predicts):")
+grp
 
+# %%
+dist = ev_n.groupby("District").agg(MAPE=("ape", "mean"), bias=("err", "mean"), group=("group", "first")).sort_values("MAPE")
+gcol = {"Mostly irrigated": "#1e4d2b", "Mixed": "#97bc62", "Mostly rain-fed": "#d4a017", "Northern, conflict-affected": "#c0392b"}
+fig, axes = plt.subplots(1, 2, figsize=(13, 5.5), sharey=True)
+axes[0].barh(dist.index, dist["MAPE"], color=dist["group"].map(gcol)); axes[0].set_xlabel("MAPE % (test, excl. 2022)")
+axes[1].barh(dist.index, dist["bias"], color=dist["group"].map(gcol)); axes[1].axvline(0, color="k", lw=0.6)
+axes[1].set_xlabel("mean error kg/ha (+ = over-predicts)")
+from matplotlib.patches import Patch
+axes[1].legend(handles=[Patch(color=c, label=k) for k, c in gcol.items()], loc="lower right", fontsize=8)
+axes[0].tick_params(axis="y", labelsize=8)
+fig.suptitle("EBM error and bias by district (test seasons, excluding the 2022 shock)")
+savefig("13_fairness")
+
+# %% [markdown]
+# **Findings (test seasons, excluding 2022)**
+# * **Mostly irrigated districts** get the most reliable forecasts: MAPE 6.6 %, and 82.5 % of forecasts within ±10 %.
+# * **Mostly rain-fed districts** have MAPE 8.8 % and are **over-predicted** on average (+61 kg/ha), because their yield depends on rainfall, which is not a feature.
+# * **Northern, conflict-affected districts** are the worst served: **MAPE 12.4 %**, only 54 % within ±10 %, and they are **under-predicted** by 131 kg/ha on average. Their history has gaps (no cultivation recorded during the war years) and post-war recovery is a trend the model has seen little of.
+#
+# **Why it matters:** if forecasts were used to allocate fertilizer, credit or procurement quotas, the Northern districts' production would be systematically underestimated. Rain-fed areas, often the poorer and more climate-exposed farming areas, would be over-estimated, so shortfalls there could be under-prepared. **Mitigations:** report district-specific error bands alongside each forecast (the app shows the typical error range), keep a human planner in the loop, add rainfall and reservoir data, and monitor per-district error after each season.
+# The dataset contains no information on individual farmers (no gender, ethnicity, income or personal identifiers), so the model makes no decisions about individuals; the fairness concern is *between regions*.
+
+# %% [markdown]
+# ## 12. Save the model and run inference on the unseen sample
+# The final (retrained) EBM is saved with `pickle` together with the metadata the front end needs.
+
+# %%
 history = feat_all[["District", "Season", "Year", "t", "Major Sown (Ha)", "Minor Sown (Ha)", "Rainfed Sown (Ha)",
                     "Total Extent (Ha)", "Net Harvest (Ha)", TARGET]]
 bundle = {
-    "model": final_model, "model_name": BEST, "features": FEATURES,
+    "model": final_model, "model_name": "Explainable Boosting Machine (EBM)", "features": FEATURES,
     "districts": sorted(model_df["District"].unique()), "seasons": ["MAHA", "YALA"],
     "test_rmse": float(res.loc[BEST, "RMSE"]), "test_mae": float(res.loc[BEST, "MAE"]),
     "trained_on": "1979-2023 (excluding Polonnaruwa Yala 2023 hold-out)",
@@ -549,8 +664,8 @@ with open(MODELS / "paddy_yield_model.pkl", "wb") as f:
     pickle.dump(bundle, f)
 history.to_csv(MODELS / "district_history.csv", index=False)
 res.round(3).to_csv(MODELS / "model_comparison.csv")
-json.dump({k: {kk: (vv if not isinstance(vv, (np.integer, np.floating)) else vv.item()) for kk, vv in v.items()}
-           for k, v in best_params.items()}, open(MODELS / "best_hyperparameters.json", "w"), indent=2)
+grp.to_csv(MODELS / "fairness_by_group.csv")
+json.dump(best_params, open(MODELS / "best_hyperparameters.json", "w"), indent=2, default=str)
 print("Saved:", MODELS / "paddy_yield_model.pkl", f"({(MODELS / 'paddy_yield_model.pkl').stat().st_size/1e6:.1f} MB)")
 
 # %%
@@ -568,12 +683,32 @@ print(f"Implied production if the sown area is harvested at last season's ratio:
       f"{pred/1000 * row['Total Extent (Ha)'] * row['harvest_ratio_prev']:,.0f} t  (actual {row['Production (MT)']:,.0f} t)")
 
 # %% [markdown]
-# ## 11. Conclusions
-# * **Problem:** forecasting district paddy yield at sowing time for Sri Lanka's Maha and Yala seasons, using DCS statistics (1979–2023).
-# * **Data work mattered:** removing 100 duplicate rows and 4 overlapping aggregate regions, fixing the kg/ha unit error, and building leakage-free lag features were essential before any modelling.
-# * **Results:** all tuned ensembles beat the existing approaches in time-series cross-validation (LightGBM CV RMSE 425 vs 513 kg/ha for linear regression and 477 for persistence). On unseen 2016–2023 seasons LightGBM's RMSE is 626 kg/ha (MAPE ≈ 13 %), 16 % better than persistence, 22 % better outside the 2022 shock year.
-# * **Honest caveat:** on the test period linear regression is close behind, because tree models cannot extrapolate the record yields of 2019–2021; retraining on recent data (done for the saved model) and drift monitoring address this.
-# * **Explainability:** SHAP and LIME show the model relies on yield history, district, irrigation mix (rain-fed share ↓) and the long-term trend – consistent with Sri Lankan agronomy, which builds trust in the predictions.
-# * **Limitation:** policy or climate shocks (2022 fertilizer ban) are not predictable from these features; every model over-predicts 2022, with errors 2.5–4 times larger than in normal seasons.
+# ## 13. Critical discussion
+# **Limitations of the model**
+# * **No extrapolation:** EBM's shape functions, like tree ensembles, are piecewise constant. Record yields beyond the training range are under-predicted (2019–2021 in the test set), so the model must be retrained every season. The deployed model is retrained on data up to 2023.
+# * **Shocks are invisible:** the 2021/22 fertilizer ban, floods and droughts after sowing are not in the features. 2022 errors were 2.5–4 times larger than in normal seasons.
+# * **District averages only:** the model cannot say anything about individual fields, varieties or farmers, and it gives a point forecast plus an error band from the test MAE, not a full probabilistic forecast.
+# * **Small data:** about 2,200 district-seasons. Validation scores vary between folds (standard deviation ≈ 40–60 kg/ha), so differences of 1–2 % between models are not meaningful.
 #
-# **Future work:** add Department of Meteorology rainfall and reservoir (tank) storage at sowing time, fertilizer issue data, and monitor the deployed model for data drift (as in the MLOps workshop) so shocks like 2022 trigger alerts and retraining.
+# **Data-quality issues found and handled**
+# * 100 duplicated rows, 4 overlapping regional aggregates, a unit label error (kg/ha shown as "MT/Ha"), numbers stored as text and "-" placeholders.
+# * Gaps from the civil-war years in Northern districts, handled as missing lags and imputed (median for the benchmark models, EBM's native missing-value handling).
+# * The DCS figures are official *estimates*, compiled from field surveys and administrative reporting, so they carry their own measurement error. Some district boundaries also changed over 45 years (for example, Kilinochchi district was created from Jaffna in 1984), so early figures may not be fully comparable.
+#
+# **Risks of bias or unfairness:** see section 11. Forecasts are least accurate for Northern conflict-affected districts (under-predicted) and rain-fed districts (over-predicted).
+#
+# **Potential real-world impact and ethical considerations**
+# * **Benefit:** an early, explainable district yield forecast can help the Department of Agriculture, the Paddy Marketing Board and the Ministry plan fertilizer distribution, storage, purchasing and imports before harvest, and can flag districts likely to fall short.
+# * **Human oversight:** the model must support, not replace, planners (lecture: accountability, human in the loop). Its exact explanations let officers see *why* a district is predicted low and challenge it with local knowledge.
+# * **Over-reliance risk:** a confident-looking number could hide a shock that the features cannot see, as in 2022. The app therefore shows an error range and states its limitations.
+# * **Data ethics:** the data are aggregated, publicly released official statistics with no personal or sensitive information, so no consent issues arise. The code and data are shared openly for reproducibility.
+
+# %% [markdown]
+# ## 14. Conclusions
+# * A local Sri Lankan problem, forecasting district paddy yield at sowing time, was solved with DCS statistics from 1979–2023 after careful cleaning (duplicates, overlapping regions, unit error, gaps) and leakage-free feature design.
+# * A **new algorithm not covered in the lectures, the Explainable Boosting Machine**, was tuned on forward-chaining validation folds. On unseen 2016–2023 seasons it matched the black-box ensembles (test RMSE 623 kg/ha vs 608–633), beat linear regression and the moving average, and was 16 % better than persistence (22 % outside the 2022 shock).
+# * Its **intrinsic explanations**, cross-checked with PDP, SHAP and LIME, show a model driven by yield history, water security (irrigation versus rain-fed) and the technology trend, consistent with domain knowledge.
+# * Critical analysis exposed the model's limits: no extrapolation, blindness to shocks, and lower accuracy for Northern conflict-affected and rain-fed districts. Those districts should get extra human scrutiny.
+# * The model is deployed in a Streamlit app that shows each prediction with its exact explanation.
+#
+# **Future work:** add Department of Meteorology rainfall and reservoir storage at sowing time, plus fertilizer issue data; produce prediction intervals; monitor per-district error and data drift every season (MLOps) and retrain automatically.

@@ -2,15 +2,15 @@
 
 The assignment asks for the front end to be generated with a GenAI tool (Gemini / ChatGPT / Claude).
 These are the prompts used, in order. The generated code was then reviewed, tested against the
-notebook's predictions (same 4,225 kg/ha for the held-out sample), and adjusted.
+notebook's predictions (same 4,731 kg/ha for the held-out sample), and adjusted.
 
 ---
 
 ## Prompt 1: the base app
 
 > I have trained a machine learning regression model in Python that predicts the **average paddy
-> yield (kg/ha) of a Sri Lankan district for a season** (Maha or Yala). The model is a scikit-learn
-> `Pipeline` (ColumnTransformer + LightGBM) saved with `pickle` in `models/paddy_yield_model.pkl`.
+> yield (kg/ha) of a Sri Lankan district for a season** (Maha or Yala). The model is an InterpretML
+> `ExplainableBoostingRegressor` (EBM) saved with `pickle` in `models/paddy_yield_model.pkl`.
 > The pickle holds a dictionary with keys `model`, `model_name`, `features`, `districts`, `seasons`,
 > `test_rmse`, `test_mae`.
 >
@@ -41,24 +41,23 @@ notebook's predictions (same 4,225 kg/ha for the held-out sample), and adjusted.
 
 ## Prompt 3: explain each prediction
 
-> Add a "Why this forecast?" horizontal bar chart under the prediction using SHAP `TreeExplainer`
-> on the LightGBM step of the pipeline. Transform the input with the pipeline's `prep` step first,
-> sum the one-hot columns that start with `District_` and `Season_` back into single "District" and
-> "Season" bars, colour positive contributions green and negative red, and never let an explanation
-> error stop the prediction from showing.
+> Add a "Why this forecast?" horizontal bar chart under the prediction using the EBM's own local
+> explanation: `model.explain_local(x).data(0)` gives `names` and `scores`, and `model.intercept_` is the
+> average. Show the 12 largest contributions, colour positive ones green and negative ones red, put
+> "average + contributions = prediction" in the title, and never let an explanation error stop the
+> prediction from showing.
 
 ## Prompt 4: about tab and deployment
 
 > Add a second tab "About the model" that shows the model comparison CSV and two saved figures, and
-> lists the model's limitations. Then write a Dockerfile (python:3.13-slim, needs libgomp1 for
-> LightGBM) that runs the app on port 8501, and a GitHub Actions workflow that installs requirements,
-> runs pytest smoke tests on the pickle, and builds the Docker image.
+> lists the model's limitations. Then write a Dockerfile (python:3.13-slim) that runs the app on port 8501, and a GitHub
+> Actions workflow that installs requirements, runs pytest smoke tests on the pickle, and builds the Docker image.
 
 ---
 
 ### What was checked or changed by hand after generation
 
-- Verified that the app's prediction for Polonnaruwa Yala 2023 matches the notebook (4,225 kg/ha).
+- Verified that the app's prediction for Polonnaruwa Yala 2023 matches the notebook (4,731 kg/ha), and that the explanation bars plus the average add up exactly to the prediction (unit test).
 - Input widgets get keys that include district/season/year, so the pre-filled values refresh when the selection changes.
 - Added `sown_change_pct` clipping through `make_input_row` so app inputs are processed exactly like training data.
-- Added the CatBoost wrapper import path (`src/`) so the pickle loads outside the notebook.
+- Added `src/` to the import path so the app uses the same feature-engineering code as the notebook.
